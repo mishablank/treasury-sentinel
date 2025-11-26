@@ -1,31 +1,30 @@
-export {
-  loadEnvConfig,
-  getEnvConfig,
-  isProduction,
-  isDevelopment,
-  isTest,
-  getChainRpcUrl,
-  type EnvConfig,
-} from './env';
+/**
+ * Configuration Module Exports
+ */
 
-export {
-  CHAIN_CONFIGS,
-  STABLECOIN_ADDRESSES,
-  getChainConfig,
-  getSupportedChainIds,
-  isChainSupported,
-  type ChainConfig,
-} from './chains';
+export * from './env';
+export * from './database';
+export * from './scheduler';
+export * from './chains';
+export * from './budget';
+export * from './payments';
 
-export {
-  getDatabaseConfig,
-  initializeDatabase,
-  type DatabaseConfig,
-} from './database';
+// Re-export commonly used configs
+import { env } from './env';
+import { databaseConfig, createDatabaseConnection } from './database';
+import { schedulerConfig, createJobSchedule } from './scheduler';
+import { SUPPORTED_CHAINS, getChainConfig, getChainRpcUrl } from './chains';
+import { budgetConfig, createBudgetConfig, calculateThresholds } from './budget';
+import { paymentConfig, http402Config, createPaymentRequest } from './payments';
 
-export {
-  getSchedulerConfig,
-  createScheduler,
-  type SchedulerConfig,
-  type ScheduledJob,
-} from './scheduler';
+export const config = {
+  env,
+  database: databaseConfig,
+  scheduler: schedulerConfig,
+  chains: SUPPORTED_CHAINS,
+  budget: budgetConfig,
+  payment: paymentConfig,
+  http402: http402Config,
+} as const;
+
+export type Config = typeof config;
