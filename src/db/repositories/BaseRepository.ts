@@ -1,81 +1,141 @@
-/**
- * Base repository implementation with common SQLite operations
- */
-
 import Database from 'better-sqlite3';
-import { Repository } from '../../types/database';
+import { getDatabaseConfig } from '../../config/database';
 
-export abstract class BaseRepository<T, ID = string> implements Repository<T, ID> {
+export interface QueryOptions {
+  orderBy?: string;
+  order?: 'ASC' | 'DESC';
+  limit?: number;
+  offset?: number;
+}
+
+export abstract class BaseRepository<T extends Record<string, unknown>> {
   protected db: Database.Database;
   protected tableName: string;
-  protected idColumn: string;
+  protected initialized: boolean = false;
 
-  constructor(db: Database.Database, tableName: string, idColumn: string = 'id') {
-    this.db = db;
+  constructor(tableName: string) {
     this.tableName = tableName;
-    this.idColumn = idColumn;
+    const config = getDatabaseConfig();
+    
+    try {
+      this.db = new Database(config.filename, {
+        verbose: config.verbose ? console.log : undefined,
+      });
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('foreign_keys = ON');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Failed to initialize database connection: ${message}`);
+    }
   }
 
-  abstract mapRowToEntity(row: any): T;
-  abstract mapEntityToRow(entity: T): Record<string, any>;
+  protected abstract createTable(): void;
 
-  async findById(id: ID): Promise<T | null> {
-    const stmt = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE ${this.idColumn} = ?`);
-    const row = stmt.get(id);
-    return row ? this.mapRowToEntity(row) : null;
+  protected ensureInitialized(): void {
+    if (!this.initialized) {
+      try {
+        this.createTable();
+        this.initialized = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        throw new Error(`Failed to create table ${this.tableName}: ${message}`);
+      }
+    }
   }
 
-  async findAll(): Promise<T[]> {
-    const stmt = this.db.prepare(`SELECT * FROM ${this.tableName}`);
-    const rows = stmt.all();
-    return rows.map(row => this.mapRowToEntity(row));
+  protected runQuery<R = unknown>(sql: string, params: unknown[] = []): R {
+    this.ensureInitialized();
+    try {
+      const stmt = this.db.prepare(sql);
+      return stmt.run(...params) as R;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Query execution failed on ${this.tableName}: ${message}`);
+    }
   }
 
-  async save(entity: T): Promise<void> {
-    const row = this.mapEntityToRow(entity);
-    const columns = Object.keys(row);
-    const placeholders = columns.map(() => '?').join(', ');
-    const values = Object.values(row);
+  protected getOne<R = T>(sql: string, params: unknown[] = []): R | undefined {
+    this.ensureInitialized();
+    try {
+      const stmt = this.db.prepare(sql);
+      return stmt.get(...params) as R | undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Query failed on ${this.tableName}: ${message}`);
+    }
+  }
 
-    const stmt = this.db.prepare(
-      `INSERT OR REPLACE INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`
+  protected getAll<R = T>(sql: string, params: unknown[] = []): R[] {
+    this.ensureInitialized();
+    try {
+      const stmt = this.db.prepare(sql);
+      return stmt.all(...params) as R[];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Query failed on ${this.tableName}: ${message}`);
+    }
+  }
+
+  findById(id: string): T | undefined {
+    return this.getOne<T>(
+      `SELECT * FROM ${this.tableName} WHERE id = ?`,
+      [id]
     );
-    stmt.run(...values);
   }
 
-  async delete(id: ID): Promise<boolean> {
-    const stmt = this.db.prepare(`DELETE FROM ${this.tableName} WHERE ${this.idColumn} = ?`);
-    const result = stmt.run(id);
+  findAll(options: QueryOptions = {}): T[] {
+    let sql = `SELECT * FROM ${this.tableName}`;
+    const params: unknown[] = [];
+
+    if (options.orderBy) {
+      const order = options.order || 'ASC';
+      // Sanitize orderBy to prevent SQL injection
+      const safeOrderBy = options.orderBy.replace(/[^a-zA-Z0-9_]/g, '');
+      sql += ` ORDER BY ${safeOrderBy} ${order}`;
+    }
+
+    if (options.limit !== undefined) {
+      sql += ' LIMIT ?';
+      params.push(options.limit);
+    }
+
+    if (options.offset !== undefined) {
+      sql += ' OFFSET ?';
+      params.push(options.offset);
+    }
+
+    return this.getAll<T>(sql, params);
+  }
+
+  deleteById(id: string): boolean {
+    const result = this.runQuery<Database.RunResult>(
+      `DELETE FROM ${this.tableName} WHERE id = ?`,
+      [id]
+    );
     return result.changes > 0;
   }
 
-  protected async findWhere(condition: string, params: any[]): Promise<T[]> {
-    const stmt = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE ${condition}`);
-    const rows = stmt.all(...params);
-    return rows.map(row => this.mapRowToEntity(row));
+  count(): number {
+    const result = this.getOne<{ count: number }>(
+      `SELECT COUNT(*) as count FROM ${this.tableName}`
+    );
+    return result?.count ?? 0;
   }
 
-  protected async findOneWhere(condition: string, params: any[]): Promise<T | null> {
-    const stmt = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE ${condition} LIMIT 1`);
-    const row = stmt.get(...params);
-    return row ? this.mapRowToEntity(row) : null;
+  truncate(): void {
+    this.runQuery(`DELETE FROM ${this.tableName}`);
   }
 
-  protected async count(condition?: string, params?: any[]): Promise<number> {
-    const query = condition
-      ? `SELECT COUNT(*) as count FROM ${this.tableName} WHERE ${condition}`
-      : `SELECT COUNT(*) as count FROM ${this.tableName}`;
-    const stmt = this.db.prepare(query);
-    const result = params ? stmt.get(...params) : stmt.get();
-    return (result as any).count;
+  close(): void {
+    try {
+      this.db.close();
+    } catch (error) {
+      // Ignore close errors
+    }
   }
 
-  protected async aggregate(column: string, func: 'SUM' | 'AVG' | 'MIN' | 'MAX', condition?: string, params?: any[]): Promise<number> {
-    const query = condition
-      ? `SELECT ${func}(${column}) as result FROM ${this.tableName} WHERE ${condition}`
-      : `SELECT ${func}(${column}) as result FROM ${this.tableName}`;
-    const stmt = this.db.prepare(query);
-    const result = params ? stmt.get(...params) : stmt.get();
-    return (result as any).result ?? 0;
+  transaction<R>(fn: () => R): R {
+    this.ensureInitialized();
+    return this.db.transaction(fn)();
   }
 }
