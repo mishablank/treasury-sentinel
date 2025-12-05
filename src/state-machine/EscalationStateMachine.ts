@@ -2,235 +2,272 @@ import {
   EscalationLevel,
   EscalationState,
   EscalationTransition,
-  GuardCondition,
-  StateTransitionResult,
+  EscalationEvent,
+  EscalationContext,
+  StateMachineConfig,
 } from '../types/escalation';
-
-export interface StateMachineConfig {
-  initialLevel: EscalationLevel;
-  budgetLimit: number;
-  currentBudgetUsed: number;
-}
-
-export interface TransitionGuard {
-  name: string;
-  condition: GuardCondition;
-  errorMessage: string;
-}
-
-const LEVEL_ORDER: EscalationLevel[] = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5'];
-
-const ESCALATION_COSTS: Record<EscalationLevel, number> = {
-  L0: 0,
-  L1: 0.1,
-  L2: 0.25,
-  L3: 0.5,
-  L4: 1.0,
-  L5: 2.5,
-};
+import {
+  canEscalate,
+  canDeescalate,
+  shouldBlockForBudget,
+  getGuardConditions,
+} from './guards';
+import {
+  STATE_CONFIGS,
+  TRANSITION_CONFIGS,
+  getStateConfig,
+  findTransition,
+  getTransitionCost,
+} from './config';
 
 export class EscalationStateMachine {
   private currentState: EscalationState;
-  private transitionHistory: EscalationTransition[] = [];
-  private guards: Map<string, TransitionGuard[]> = new Map();
-  private budgetLimit: number;
-  private budgetUsed: number;
+  private history: EscalationTransition[] = [];
+  private config: StateMachineConfig;
 
-  constructor(config: StateMachineConfig) {
-    this.budgetLimit = config.budgetLimit;
-    this.budgetUsed = config.currentBudgetUsed;
+  constructor(config?: Partial<StateMachineConfig>) {
+    this.config = {
+      initialLevel: EscalationLevel.L0_IDLE,
+      budgetLimit: 10.0,
+      autoDeescalate: true,
+      deescalateDelayMs: 300000, // 5 minutes
+      ...config,
+    };
+
+    const stateConfig = getStateConfig(this.config.initialLevel);
     this.currentState = {
-      level: config.initialLevel,
+      level: this.config.initialLevel,
       enteredAt: new Date(),
-      reason: 'Initial state',
-      metadata: {},
-    };
-    this.initializeDefaultGuards();
-  }
-
-  private initializeDefaultGuards(): void {
-    // Budget guard - applies to all escalation transitions
-    const budgetGuard: TransitionGuard = {
-      name: 'budget_check',
-      condition: (from, to) => {
-        const cost = ESCALATION_COSTS[to];
-        return this.budgetUsed + cost <= this.budgetLimit;
+      context: {
+        treasuryId: '',
+        currentSpend: 0,
+        budgetLimit: this.config.budgetLimit,
+        riskScore: 0,
+        liquidityRatio: 1.0,
+        volatilityRegime: 'low',
+        lastMarketDataFetch: null,
+        pendingPaymentId: null,
       },
-      errorMessage: 'Insufficient budget for escalation',
-    };
-
-    // Sequential escalation guard - can only go up one level at a time
-    const sequentialGuard: TransitionGuard = {
-      name: 'sequential_escalation',
-      condition: (from, to) => {
-        const fromIndex = LEVEL_ORDER.indexOf(from);
-        const toIndex = LEVEL_ORDER.indexOf(to);
-        // Allow de-escalation to any lower level, but escalation must be sequential
-        return toIndex <= fromIndex + 1;
+      metadata: {
+        stateName: stateConfig.name,
+        stateColor: stateConfig.color,
       },
-      errorMessage: 'Can only escalate one level at a time',
     };
-
-    // Apply guards to all transitions
-    for (const level of LEVEL_ORDER) {
-      this.guards.set(level, [budgetGuard, sequentialGuard]);
-    }
   }
 
-  public addGuard(forLevel: EscalationLevel, guard: TransitionGuard): void {
-    const existingGuards = this.guards.get(forLevel) || [];
-    existingGuards.push(guard);
-    this.guards.set(forLevel, existingGuards);
-  }
-
-  public getCurrentState(): EscalationState {
+  getState(): EscalationState {
     return { ...this.currentState };
   }
 
-  public getCurrentLevel(): EscalationLevel {
+  getLevel(): EscalationLevel {
     return this.currentState.level;
   }
 
-  public getRemainingBudget(): number {
-    return this.budgetLimit - this.budgetUsed;
+  getContext(): EscalationContext {
+    return { ...this.currentState.context };
   }
 
-  public getEscalationCost(level: EscalationLevel): number {
-    return ESCALATION_COSTS[level];
+  getHistory(): EscalationTransition[] {
+    return [...this.history];
   }
 
-  public canTransitionTo(targetLevel: EscalationLevel): StateTransitionResult {
-    const guards = this.guards.get(targetLevel) || [];
-    const failedGuards: string[] = [];
+  getAvailableTransitions(): EscalationLevel[] {
+    const currentLevel = this.currentState.level;
+    const context = this.currentState.context;
 
-    for (const guard of guards) {
-      if (!guard.condition(this.currentState.level, targetLevel)) {
-        failedGuards.push(guard.errorMessage);
+    return TRANSITION_CONFIGS
+      .filter((t) => t.from === currentLevel)
+      .filter((t) => this.evaluateGuard(t.guard, context))
+      .map((t) => t.to);
+  }
+
+  getTransitionCost(targetLevel: EscalationLevel): number {
+    return getTransitionCost(this.currentState.level, targetLevel);
+  }
+
+  canTransitionTo(targetLevel: EscalationLevel): boolean {
+    const transition = findTransition(this.currentState.level, targetLevel);
+    if (!transition) return false;
+    return this.evaluateGuard(transition.guard, this.currentState.context);
+  }
+
+  private evaluateGuard(guardName: string, context: EscalationContext): boolean {
+    const guards = getGuardConditions();
+
+    switch (guardName) {
+      case 'canStartMonitoring':
+        return guards.canStartMonitoring(context);
+      case 'shouldEscalateToAlert':
+        return guards.shouldEscalateToAlert(context);
+      case 'shouldEscalateToMarketData':
+        return guards.shouldEscalateToMarketData(context);
+      case 'shouldEscalateToCritical':
+        return guards.shouldEscalateToCritical(context);
+      case 'shouldEscalateToEmergency':
+        return guards.shouldEscalateToEmergency(context);
+      case 'canDeescalateFromEmergency':
+        return guards.canDeescalateFromEmergency(context);
+      case 'canDeescalateFromCritical':
+        return guards.canDeescalateFromCritical(context);
+      case 'canDeescalateFromMarketData':
+        return guards.canDeescalateFromMarketData(context);
+      case 'canDeescalateFromAlert':
+        return guards.canDeescalateFromAlert(context);
+      case 'canStopMonitoring':
+        return guards.canStopMonitoring(context);
+      case 'isBudgetExhausted':
+        return shouldBlockForBudget(context);
+      case 'hasBudgetRestored':
+        return context.currentSpend < context.budgetLimit * 0.9;
+      default:
+        console.warn(`Unknown guard: ${guardName}`);
+        return false;
+    }
+  }
+
+  async transition(
+    targetLevel: EscalationLevel,
+    event: EscalationEvent
+  ): Promise<EscalationTransition> {
+    const fromLevel = this.currentState.level;
+    const transitionConfig = findTransition(fromLevel, targetLevel);
+
+    if (!transitionConfig) {
+      throw new Error(
+        `Invalid transition: ${fromLevel} -> ${targetLevel}`
+      );
+    }
+
+    if (!this.evaluateGuard(transitionConfig.guard, this.currentState.context)) {
+      throw new Error(
+        `Guard condition '${transitionConfig.guard}' not satisfied for transition ${fromLevel} -> ${targetLevel}`
+      );
+    }
+
+    // Check budget for paid transitions
+    if (transitionConfig.requiresPayment) {
+      const cost = transitionConfig.cost ?? 0;
+      const newSpend = this.currentState.context.currentSpend + cost;
+
+      if (newSpend > this.currentState.context.budgetLimit) {
+        // Redirect to budget blocked
+        return this.transition(EscalationLevel.BUDGET_BLOCKED, {
+          type: 'BUDGET_EXCEEDED',
+          timestamp: new Date(),
+          payload: { requiredAmount: cost, availableBudget: this.currentState.context.budgetLimit - this.currentState.context.currentSpend },
+        });
+      }
+
+      // Update spend
+      this.currentState.context.currentSpend = newSpend;
+    }
+
+    const now = new Date();
+    const targetConfig = getStateConfig(targetLevel);
+
+    const transition: EscalationTransition = {
+      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      from: fromLevel,
+      to: targetLevel,
+      triggeredBy: event,
+      timestamp: now,
+      guardConditions: [transitionConfig.guard],
+      cost: transitionConfig.cost,
+    };
+
+    // Update state
+    this.currentState = {
+      level: targetLevel,
+      enteredAt: now,
+      context: { ...this.currentState.context },
+      previousLevel: fromLevel,
+      metadata: {
+        stateName: targetConfig.name,
+        stateColor: targetConfig.color,
+        lastTransition: transition,
+      },
+    };
+
+    this.history.push(transition);
+
+    return transition;
+  }
+
+  updateContext(updates: Partial<EscalationContext>): void {
+    this.currentState.context = {
+      ...this.currentState.context,
+      ...updates,
+    };
+  }
+
+  async processEvent(event: EscalationEvent): Promise<EscalationTransition | null> {
+    const availableTransitions = this.getAvailableTransitions();
+
+    if (availableTransitions.length === 0) {
+      return null;
+    }
+
+    // Priority: budget block > emergency > critical > market data > alert > monitor > idle
+    const priorityOrder = [
+      EscalationLevel.BUDGET_BLOCKED,
+      EscalationLevel.L5_EMERGENCY,
+      EscalationLevel.L4_CRITICAL,
+      EscalationLevel.L3_MARKET_DATA,
+      EscalationLevel.L2_ALERT,
+      EscalationLevel.L1_MONITOR,
+      EscalationLevel.L0_IDLE,
+    ];
+
+    for (const targetLevel of priorityOrder) {
+      if (availableTransitions.includes(targetLevel)) {
+        return this.transition(targetLevel, event);
       }
     }
 
-    if (failedGuards.length > 0) {
-      return {
-        success: false,
-        previousLevel: this.currentState.level,
-        newLevel: this.currentState.level,
-        failedGuards,
-      };
-    }
-
-    return {
-      success: true,
-      previousLevel: this.currentState.level,
-      newLevel: targetLevel,
-      cost: ESCALATION_COSTS[targetLevel],
-    };
+    return null;
   }
 
-  public transitionTo(
-    targetLevel: EscalationLevel,
-    reason: string,
-    metadata: Record<string, unknown> = {}
-  ): StateTransitionResult {
-    const canTransition = this.canTransitionTo(targetLevel);
-
-    if (!canTransition.success) {
-      return canTransition;
-    }
-
-    const previousLevel = this.currentState.level;
-    const cost = ESCALATION_COSTS[targetLevel];
-
-    // Record the transition
-    const transition: EscalationTransition = {
-      from: previousLevel,
-      to: targetLevel,
-      timestamp: new Date(),
-      reason,
-      cost,
-      triggeredBy: metadata.triggeredBy as string || 'system',
-    };
-
-    this.transitionHistory.push(transition);
-
-    // Update budget
-    this.budgetUsed += cost;
-
-    // Update current state
+  reset(): void {
+    const stateConfig = getStateConfig(this.config.initialLevel);
     this.currentState = {
-      level: targetLevel,
+      level: this.config.initialLevel,
       enteredAt: new Date(),
-      reason,
-      metadata,
+      context: {
+        treasuryId: '',
+        currentSpend: 0,
+        budgetLimit: this.config.budgetLimit,
+        riskScore: 0,
+        liquidityRatio: 1.0,
+        volatilityRegime: 'low',
+        lastMarketDataFetch: null,
+        pendingPaymentId: null,
+      },
+      metadata: {
+        stateName: stateConfig.name,
+        stateColor: stateConfig.color,
+      },
     };
-
-    return {
-      success: true,
-      previousLevel,
-      newLevel: targetLevel,
-      cost,
-    };
+    this.history = [];
   }
 
-  public escalate(reason: string, metadata?: Record<string, unknown>): StateTransitionResult {
-    const currentIndex = LEVEL_ORDER.indexOf(this.currentState.level);
-    
-    if (currentIndex >= LEVEL_ORDER.length - 1) {
-      return {
-        success: false,
-        previousLevel: this.currentState.level,
-        newLevel: this.currentState.level,
-        failedGuards: ['Already at maximum escalation level'],
-      };
+  exportMermaid(): string {
+    const lines: string[] = ['stateDiagram-v2'];
+
+    // Add states
+    for (const [level, config] of Object.entries(STATE_CONFIGS)) {
+      lines.push(`    ${level}: ${config.name}`);
     }
 
-    const nextLevel = LEVEL_ORDER[currentIndex + 1];
-    return this.transitionTo(nextLevel, reason, metadata);
-  }
+    lines.push('');
 
-  public deescalate(reason: string, metadata?: Record<string, unknown>): StateTransitionResult {
-    const currentIndex = LEVEL_ORDER.indexOf(this.currentState.level);
-    
-    if (currentIndex <= 0) {
-      return {
-        success: false,
-        previousLevel: this.currentState.level,
-        newLevel: this.currentState.level,
-        failedGuards: ['Already at minimum escalation level'],
-      };
+    // Add transitions
+    for (const transition of TRANSITION_CONFIGS) {
+      const label = transition.cost
+        ? `${transition.label} ($${transition.cost})`
+        : transition.label;
+      lines.push(`    ${transition.from} --> ${transition.to}: ${label}`);
     }
 
-    const prevLevel = LEVEL_ORDER[currentIndex - 1];
-    return this.transitionTo(prevLevel, reason, metadata);
-  }
-
-  public getTransitionHistory(): EscalationTransition[] {
-    return [...this.transitionHistory];
-  }
-
-  public getTotalCost(): number {
-    return this.transitionHistory.reduce((sum, t) => sum + t.cost, 0);
-  }
-
-  public isBudgetBlocked(): boolean {
-    // Check if we can't even do the cheapest escalation
-    const currentIndex = LEVEL_ORDER.indexOf(this.currentState.level);
-    if (currentIndex >= LEVEL_ORDER.length - 1) {
-      return false; // Already at max, not blocked
-    }
-    
-    const nextLevel = LEVEL_ORDER[currentIndex + 1];
-    const nextCost = ESCALATION_COSTS[nextLevel];
-    return this.budgetUsed + nextCost > this.budgetLimit;
-  }
-
-  public toJSON(): object {
-    return {
-      currentState: this.currentState,
-      transitionHistory: this.transitionHistory,
-      budgetLimit: this.budgetLimit,
-      budgetUsed: this.budgetUsed,
-      remainingBudget: this.getRemainingBudget(),
-      isBudgetBlocked: this.isBudgetBlocked(),
-    };
+    return lines.join('\n');
   }
 }

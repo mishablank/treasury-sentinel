@@ -1,13 +1,17 @@
 export { EscalationStateMachine } from './EscalationStateMachine';
-export type { StateMachineConfig, TransitionGuard } from './EscalationStateMachine';
-
 export {
-  createLCRGuard,
-  createVolatilityGuard,
-  createExitHalfLifeGuard,
-  createCooldownGuard,
-  createCompositeGuard,
-  createAnyOfGuard,
-  DEFAULT_RISK_THRESHOLDS,
+  canEscalate,
+  canDeescalate,
+  shouldBlockForBudget,
+  getGuardConditions,
 } from './guards';
-export type { RiskThresholds } from './guards';
+export {
+  STATE_CONFIGS,
+  TRANSITION_CONFIGS,
+  getStateConfig,
+  getTransitionsFrom,
+  getTransitionsTo,
+  findTransition,
+  getTransitionCost,
+} from './config';
+export type { StateConfig, TransitionConfig } from './config';
