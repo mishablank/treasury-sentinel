@@ -1,199 +1,186 @@
 import { EventEmitter } from 'events';
-import type { BudgetStatus } from '../../config/budget';
-import { budgetConfig, checkBudgetAvailable, getBudgetStatus } from '../../config/budget';
+import type { DatabaseConfig } from '../../config/database';
 
 export interface ServiceConfig {
   name: string;
-  enableBudgetCheck?: boolean;
-  maxRetries?: number;
-  retryDelayMs?: number;
-}
-
-export interface ServiceMetrics {
-  totalCalls: number;
-  successfulCalls: number;
-  failedCalls: number;
-  totalLatencyMs: number;
-  lastCallTimestamp?: Date;
-  lastError?: string;
+  version: string;
+  enabled: boolean;
 }
 
 export interface ServiceHealth {
   status: 'healthy' | 'degraded' | 'unhealthy';
   lastCheck: Date;
-  metrics: ServiceMetrics;
-  budgetStatus?: BudgetStatus;
+  latency?: number;
+  details?: Record<string, unknown>;
+}
+
+export interface ServiceMetrics {
+  requestCount: number;
+  errorCount: number;
+  averageLatency: number;
+  lastUpdated: Date;
 }
 
 export abstract class BaseService extends EventEmitter {
-  protected readonly config: ServiceConfig;
+  protected readonly name: string;
+  protected readonly version: string;
+  protected enabled: boolean;
   protected metrics: ServiceMetrics;
+  protected health: ServiceHealth;
   protected initialized: boolean = false;
 
   constructor(config: ServiceConfig) {
     super();
-    this.config = {
-      enableBudgetCheck: true,
-      maxRetries: 3,
-      retryDelayMs: 1000,
-      ...config
-    };
+    this.name = config.name;
+    this.version = config.version;
+    this.enabled = config.enabled;
     this.metrics = {
-      totalCalls: 0,
-      successfulCalls: 0,
-      failedCalls: 0,
-      totalLatencyMs: 0
+      requestCount: 0,
+      errorCount: 0,
+      averageLatency: 0,
+      lastUpdated: new Date(),
+    };
+    this.health = {
+      status: 'unhealthy',
+      lastCheck: new Date(),
     };
   }
 
-  public get name(): string {
-    return this.config.name;
+  abstract initialize(): Promise<void>;
+  abstract shutdown(): Promise<void>;
+  abstract healthCheck(): Promise<ServiceHealth>;
+
+  getName(): string {
+    return this.name;
   }
 
-  public get isInitialized(): boolean {
+  getVersion(): string {
+    return this.version;
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  isInitialized(): boolean {
     return this.initialized;
   }
 
-  protected async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
-    await this.onInitialize();
-    this.initialized = true;
-    this.emit('initialized', { service: this.name });
+  enable(): void {
+    this.enabled = true;
+    this.emit('enabled', { service: this.name });
   }
 
-  protected abstract onInitialize(): Promise<void>;
-
-  protected async shutdown(): Promise<void> {
-    if (!this.initialized) {
-      return;
-    }
-    await this.onShutdown();
-    this.initialized = false;
-    this.emit('shutdown', { service: this.name });
+  disable(): void {
+    this.enabled = false;
+    this.emit('disabled', { service: this.name });
   }
 
-  protected abstract onShutdown(): Promise<void>;
-
-  protected checkBudget(): boolean {
-    if (!this.config.enableBudgetCheck) {
-      return true;
-    }
-    return checkBudgetAvailable(0);
+  getMetrics(): ServiceMetrics {
+    return { ...this.metrics };
   }
 
-  protected async executeWithMetrics<T>(
-    operation: () => Promise<T>,
-    operationName: string
-  ): Promise<T> {
-    const startTime = Date.now();
-    this.metrics.totalCalls++;
-    this.metrics.lastCallTimestamp = new Date();
+  getHealth(): ServiceHealth {
+    return { ...this.health };
+  }
 
+  protected recordRequest(latency: number): void {
+    const totalLatency = this.metrics.averageLatency * this.metrics.requestCount + latency;
+    this.metrics.requestCount++;
+    this.metrics.averageLatency = totalLatency / this.metrics.requestCount;
+    this.metrics.lastUpdated = new Date();
+  }
+
+  protected recordError(error: Error): void {
+    this.metrics.errorCount++;
+    this.metrics.lastUpdated = new Date();
+    this.emit('error', { service: this.name, error });
+  }
+
+  protected async withTiming<T>(operation: () => Promise<T>): Promise<T> {
+    const start = Date.now();
     try {
       const result = await operation();
-      this.metrics.successfulCalls++;
-      this.metrics.totalLatencyMs += Date.now() - startTime;
-      
-      this.emit('operation:success', {
-        service: this.name,
-        operation: operationName,
-        durationMs: Date.now() - startTime
-      });
-
+      this.recordRequest(Date.now() - start);
       return result;
     } catch (error) {
-      this.metrics.failedCalls++;
-      this.metrics.lastError = error instanceof Error ? error.message : String(error);
-      this.metrics.totalLatencyMs += Date.now() - startTime;
-
-      this.emit('operation:error', {
-        service: this.name,
-        operation: operationName,
-        error: this.metrics.lastError,
-        durationMs: Date.now() - startTime
-      });
-
+      this.recordError(error as Error);
       throw error;
     }
   }
 
-  protected async executeWithRetry<T>(
-    operation: () => Promise<T>,
-    operationName: string
-  ): Promise<T> {
-    let lastError: Error | undefined;
-    const maxRetries = this.config.maxRetries ?? 3;
-    const retryDelay = this.config.retryDelayMs ?? 1000;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        return await this.executeWithMetrics(operation, operationName);
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-        
-        if (attempt < maxRetries) {
-          this.emit('operation:retry', {
-            service: this.name,
-            operation: operationName,
-            attempt,
-            maxRetries,
-            error: lastError.message
-          });
-          
-          await this.delay(retryDelay * attempt);
-        }
-      }
-    }
-
-    throw lastError;
-  }
-
-  protected delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  public getHealth(): ServiceHealth {
-    const successRate = this.metrics.totalCalls > 0
-      ? this.metrics.successfulCalls / this.metrics.totalCalls
-      : 1;
-
-    let status: 'healthy' | 'degraded' | 'unhealthy';
-    if (successRate >= 0.95 && this.initialized) {
-      status = 'healthy';
-    } else if (successRate >= 0.7) {
-      status = 'degraded';
-    } else {
-      status = 'unhealthy';
-    }
-
-    return {
+  protected updateHealth(status: ServiceHealth['status'], details?: Record<string, unknown>): void {
+    this.health = {
       status,
       lastCheck: new Date(),
-      metrics: { ...this.metrics },
-      budgetStatus: this.config.enableBudgetCheck ? getBudgetStatus() : undefined
+      details,
     };
+    this.emit('health-change', { service: this.name, health: this.health });
+  }
+}
+
+export abstract class DatabaseAwareService extends BaseService {
+  protected dbConfig: DatabaseConfig;
+
+  constructor(config: ServiceConfig, dbConfig: DatabaseConfig) {
+    super(config);
+    this.dbConfig = dbConfig;
   }
 
-  public getMetrics(): ServiceMetrics {
-    return { ...this.metrics };
+  protected getDatabasePath(): string {
+    return this.dbConfig.path;
   }
 
-  public getAverageLatency(): number {
-    if (this.metrics.totalCalls === 0) {
-      return 0;
+  protected isWalMode(): boolean {
+    return this.dbConfig.walMode;
+  }
+}
+
+export abstract class CacheableService extends BaseService {
+  protected cache: Map<string, { value: unknown; expiry: number }> = new Map();
+  protected defaultTtl: number;
+
+  constructor(config: ServiceConfig, defaultTtl: number = 60000) {
+    super(config);
+    this.defaultTtl = defaultTtl;
+  }
+
+  protected getCached<T>(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiry) {
+      this.cache.delete(key);
+      return null;
     }
-    return this.metrics.totalLatencyMs / this.metrics.totalCalls;
+    return entry.value as T;
   }
 
-  public resetMetrics(): void {
-    this.metrics = {
-      totalCalls: 0,
-      successfulCalls: 0,
-      failedCalls: 0,
-      totalLatencyMs: 0
-    };
-    this.emit('metrics:reset', { service: this.name });
+  protected setCached<T>(key: string, value: T, ttl?: number): void {
+    this.cache.set(key, {
+      value,
+      expiry: Date.now() + (ttl ?? this.defaultTtl),
+    });
+  }
+
+  protected invalidateCache(pattern?: string): void {
+    if (!pattern) {
+      this.cache.clear();
+      return;
+    }
+    const regex = new RegExp(pattern);
+    for (const key of this.cache.keys()) {
+      if (regex.test(key)) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  protected cleanupExpired(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now > entry.expiry) {
+        this.cache.delete(key);
+      }
+    }
   }
 }
