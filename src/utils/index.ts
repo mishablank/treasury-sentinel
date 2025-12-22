@@ -1,40 +1,23 @@
 /**
- * Utility exports for treasury sentinel
+ * Utility exports
  */
 
-export {
-  ValidationResult,
-  validateEscalationLevel,
-  validateChainId,
-  validateAddress,
-  validateTransactionHash,
-  validatePositiveNumber,
-  validateNonNegativeNumber,
-  validatePercentage,
-  validateBudgetAmount,
-  validateDateRange,
-  validateTokenSymbol,
-  validateUUID,
-  assertValid,
-  createValidator
-} from './validation';
+export * from './validation';
+export * from './serialization';
+export * from './errors';
+export * from './logger';
 
-export {
-  SerializationOptions,
-  serialize,
-  deserialize,
-  serializeTreasurySnapshot,
-  deserializeTreasurySnapshot,
-  serializeEscalationState,
-  deserializeEscalationState,
-  serializePaymentRecord,
-  deserializePaymentRecord,
-  serializeAgentRun,
-  deserializeAgentRun,
-  toBase64,
-  fromBase64,
-  compactSerialize,
-  compactDeserialize,
-  deepClone,
-  isSerializable
-} from './serialization';
+// Re-export commonly used items
+export { logger, createLogger } from './logger';
+export { 
+  SentinelError, 
+  BudgetError, 
+  PaymentError, 
+  ApiError, 
+  ChainError,
+  StateMachineError,
+  DatabaseError,
+  wrapError,
+  isRetryable,
+  ErrorCode 
+} from './errors';
