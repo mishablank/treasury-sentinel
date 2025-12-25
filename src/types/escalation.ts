@@ -1,122 +1,156 @@
-/**
- * Escalation state machine type definitions
- * Implements L0-L5 risk escalation ladder
- */
-
-export type EscalationLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
-
-export type EscalationState =
-  | 'IDLE'
-  | 'MONITORING'
-  | 'ALERT_PENDING'
-  | 'ESCALATING'
-  | 'BUDGET_BLOCKED'
-  | 'COOLDOWN';
-
-export interface EscalationGuard {
-  id: string;
-  name: string;
-  description: string;
-  evaluate: (context: EscalationContext) => boolean;
-}
-
-export interface EscalationTransition {
-  from: EscalationState;
-  to: EscalationState;
-  guards: EscalationGuard[];
-  label: string;
+export enum EscalationLevel {
+  L0_IDLE = 'L0_IDLE',
+  L1_MONITORING = 'L1_MONITORING',
+  L2_ALERT = 'L2_ALERT',
+  L3_WARNING = 'L3_WARNING',
+  L4_CRITICAL = 'L4_CRITICAL',
+  L5_EMERGENCY = 'L5_EMERGENCY',
 }
 
 export interface EscalationContext {
   currentLevel: EscalationLevel;
-  currentState: EscalationState;
-  budgetRemaining: number;
-  budgetLimit: number;
-  lastEscalationTime: Date | null;
-  cooldownEndTime: Date | null;
-  riskMetrics: RiskMetricsSummary;
+  previousLevel?: EscalationLevel;
+  riskScore?: number;
+  budgetSpent?: number;
+  lastEscalationTime?: Date;
+  lastDataUpdate?: Date;
+  consecutiveAlerts?: number;
+  isBlocked?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
-export interface RiskMetricsSummary {
-  lcr: number; // Liquidity Coverage Ratio
-  exitHalfLife: number; // Hours to exit 50% of position
-  volatilityRegime: 'low' | 'medium' | 'high' | 'extreme';
-  depthScore: number; // 0-100 liquidity depth score
+export interface StateTransition {
+  from: EscalationLevel;
+  to: EscalationLevel;
+  trigger: string;
+  guards: string[];
+  timestamp: Date;
+  context: EscalationContext;
+}
+
+export interface EscalationState {
+  level: EscalationLevel;
+  enteredAt: Date;
+  transitionCount: number;
+  history: StateTransition[];
 }
 
 export interface EscalationEvent {
-  id: string;
+  type: 'ESCALATE' | 'DE_ESCALATE' | 'RESET' | 'BLOCK' | 'UNBLOCK';
+  targetLevel?: EscalationLevel;
+  reason?: string;
   timestamp: Date;
-  fromLevel: EscalationLevel;
-  toLevel: EscalationLevel;
-  fromState: EscalationState;
-  toState: EscalationState;
-  trigger: string;
-  context: EscalationContext;
-  costIncurred: number;
 }
 
-export interface EscalationLevelConfig {
-  level: EscalationLevel;
-  name: string;
-  description: string;
-  thresholds: {
-    lcrMin?: number;
-    exitHalfLifeMax?: number;
-    volatilityRegimes?: Array<'low' | 'medium' | 'high' | 'extreme'>;
-    depthScoreMin?: number;
-  };
-  actions: string[];
-  dataCost: number; // USDC cost for data fetch at this level
+export interface GuardEvaluation {
+  guardName: string;
+  passed: boolean;
+  reason?: string;
 }
 
-export const ESCALATION_LEVELS: EscalationLevelConfig[] = [
-  {
-    level: 'L0',
-    name: 'Normal',
-    description: 'Standard monitoring, no alerts',
-    thresholds: { lcrMin: 150, depthScoreMin: 70 },
-    actions: ['snapshot'],
-    dataCost: 0,
-  },
-  {
-    level: 'L1',
-    name: 'Watch',
-    description: 'Elevated monitoring frequency',
-    thresholds: { lcrMin: 120, depthScoreMin: 50 },
-    actions: ['snapshot', 'basic_metrics'],
-    dataCost: 0.1,
-  },
-  {
-    level: 'L2',
-    name: 'Caution',
-    description: 'Enhanced data collection',
-    thresholds: { lcrMin: 100, volatilityRegimes: ['medium', 'high', 'extreme'] },
-    actions: ['snapshot', 'basic_metrics', 'depth_analysis'],
-    dataCost: 0.5,
-  },
-  {
-    level: 'L3',
-    name: 'Warning',
-    description: 'Full liquidity analysis',
-    thresholds: { lcrMin: 80, exitHalfLifeMax: 48 },
-    actions: ['snapshot', 'basic_metrics', 'depth_analysis', 'impact_curves'],
-    dataCost: 1.0,
-  },
-  {
-    level: 'L4',
-    name: 'Critical',
-    description: 'Real-time monitoring activated',
-    thresholds: { lcrMin: 60, exitHalfLifeMax: 24, volatilityRegimes: ['high', 'extreme'] },
-    actions: ['snapshot', 'basic_metrics', 'depth_analysis', 'impact_curves', 'realtime_feed'],
-    dataCost: 2.0,
-  },
-  {
-    level: 'L5',
-    name: 'Emergency',
-    description: 'Maximum data resolution, all feeds active',
-    thresholds: { lcrMin: 0 },
-    actions: ['snapshot', 'basic_metrics', 'depth_analysis', 'impact_curves', 'realtime_feed', 'emergency_alerts'],
-    dataCost: 5.0,
-  },
+export interface TransitionResult {
+  success: boolean;
+  from: EscalationLevel;
+  to: EscalationLevel;
+  guardResults: GuardEvaluation[];
+  error?: string;
+  timestamp: Date;
+}
+
+export const LEVEL_ORDER: EscalationLevel[] = [
+  EscalationLevel.L0_IDLE,
+  EscalationLevel.L1_MONITORING,
+  EscalationLevel.L2_ALERT,
+  EscalationLevel.L3_WARNING,
+  EscalationLevel.L4_CRITICAL,
+  EscalationLevel.L5_EMERGENCY,
 ];
+
+export function getLevelIndex(level: EscalationLevel): number {
+  const index = LEVEL_ORDER.indexOf(level);
+  if (index === -1) {
+    throw new Error(`Invalid escalation level: ${level}`);
+  }
+  return index;
+}
+
+export function getNextLevel(current: EscalationLevel): EscalationLevel | null {
+  const index = getLevelIndex(current);
+  if (index >= LEVEL_ORDER.length - 1) {
+    return null;
+  }
+  return LEVEL_ORDER[index + 1];
+}
+
+export function getPreviousLevel(current: EscalationLevel): EscalationLevel | null {
+  const index = getLevelIndex(current);
+  if (index <= 0) {
+    return null;
+  }
+  return LEVEL_ORDER[index - 1];
+}
+
+export function isValidTransition(
+  from: EscalationLevel,
+  to: EscalationLevel
+): boolean {
+  const fromIndex = getLevelIndex(from);
+  const toIndex = getLevelIndex(to);
+  
+  // Allow same level (no-op)
+  if (fromIndex === toIndex) {
+    return true;
+  }
+  
+  // Allow single step in either direction
+  return Math.abs(toIndex - fromIndex) === 1;
+}
+
+export function createDefaultContext(): EscalationContext {
+  return {
+    currentLevel: EscalationLevel.L0_IDLE,
+    riskScore: 0,
+    budgetSpent: 0,
+    consecutiveAlerts: 0,
+    isBlocked: false,
+  };
+}
+
+export function validateContext(context: EscalationContext): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  
+  if (!context) {
+    return { valid: false, errors: ['Context is null or undefined'] };
+  }
+  
+  if (!Object.values(EscalationLevel).includes(context.currentLevel)) {
+    errors.push(`Invalid current level: ${context.currentLevel}`);
+  }
+  
+  if (context.riskScore !== undefined) {
+    if (typeof context.riskScore !== 'number' || isNaN(context.riskScore)) {
+      errors.push('Risk score must be a valid number');
+    } else if (context.riskScore < 0 || context.riskScore > 100) {
+      errors.push('Risk score must be between 0 and 100');
+    }
+  }
+  
+  if (context.budgetSpent !== undefined) {
+    if (typeof context.budgetSpent !== 'number' || isNaN(context.budgetSpent)) {
+      errors.push('Budget spent must be a valid number');
+    } else if (context.budgetSpent < 0) {
+      errors.push('Budget spent cannot be negative');
+    }
+  }
+  
+  if (context.consecutiveAlerts !== undefined) {
+    if (!Number.isInteger(context.consecutiveAlerts) || context.consecutiveAlerts < 0) {
+      errors.push('Consecutive alerts must be a non-negative integer');
+    }
+  }
+  
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
