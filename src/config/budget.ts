@@ -1,143 +1,151 @@
-export interface BudgetConfig {
-  demoBudgetUsdc: number;
-  warningThresholdPercent: number;
-  criticalThresholdPercent: number;
-  autoBlockEnabled: boolean;
-  reserveBuffer: number;
-}
-
-export const BUDGET_LIMITS = {
-  DEMO_BUDGET_USDC: 10.0,
-  WARNING_THRESHOLD: 0.8,
-  CRITICAL_THRESHOLD: 0.95,
-  MINIMUM_RESERVE: 0.01,
-  MAX_SINGLE_PAYMENT: 2.0,
-} as const;
+import { BudgetConfig, BudgetState } from '../types/treasury';
 
 export const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
-  demoBudgetUsdc: BUDGET_LIMITS.DEMO_BUDGET_USDC,
-  warningThresholdPercent: BUDGET_LIMITS.WARNING_THRESHOLD * 100,
-  criticalThresholdPercent: BUDGET_LIMITS.CRITICAL_THRESHOLD * 100,
+  maxBudgetUSDC: 10,
+  warningThresholdPercent: 80,
+  criticalThresholdPercent: 95,
   autoBlockEnabled: true,
-  reserveBuffer: BUDGET_LIMITS.MINIMUM_RESERVE,
 };
 
-export enum BudgetStatus {
-  HEALTHY = 'HEALTHY',
-  WARNING = 'WARNING',
-  CRITICAL = 'CRITICAL',
-  BLOCKED = 'BLOCKED',
-}
-
-export interface BudgetState {
-  totalBudget: number;
+export interface BudgetStatus {
   spent: number;
   remaining: number;
-  status: BudgetStatus;
+  percentUsed: number;
+  state: BudgetState;
+  isBlocked: boolean;
   lastUpdated: Date;
-  transactionCount: number;
 }
 
-// Safe arithmetic for budget calculations
-export function safeSubtract(a: number, b: number): number {
-  const result = Math.round((a - b) * 1000000) / 1000000;
-  return Math.max(0, result); // Never go negative
+export type BudgetState = 'HEALTHY' | 'WARNING' | 'CRITICAL' | 'BUDGET_BLOCKED';
+
+export class BudgetEnforcer {
+  private config: BudgetConfig;
+  private spent: number = 0;
+  private locked: boolean = false;
+  private lockPromise: Promise<void> | null = null;
+  private lastUpdated: Date = new Date();
+
+  constructor(config: BudgetConfig = DEFAULT_BUDGET_CONFIG) {
+    this.config = config;
+  }
+
+  private async acquireLock(): Promise<void> {
+    while (this.locked) {
+      await this.lockPromise;
+    }
+    this.locked = true;
+    this.lockPromise = new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+
+  private releaseLock(): void {
+    this.locked = false;
+    this.lockPromise = null;
+  }
+
+  async canSpend(amount: number): Promise<boolean> {
+    await this.acquireLock();
+    try {
+      const wouldSpend = this.spent + amount;
+      const canAfford = wouldSpend <= this.config.maxBudgetUSDC;
+      const notBlocked = this.getStateUnsafe() !== 'BUDGET_BLOCKED';
+      return canAfford && notBlocked;
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  async recordSpend(amount: number): Promise<boolean> {
+    await this.acquireLock();
+    try {
+      const currentState = this.getStateUnsafe();
+      
+      // Prevent spending when blocked
+      if (currentState === 'BUDGET_BLOCKED') {
+        return false;
+      }
+
+      const wouldSpend = this.spent + amount;
+      
+      // Prevent overspending
+      if (wouldSpend > this.config.maxBudgetUSDC) {
+        return false;
+      }
+
+      this.spent = wouldSpend;
+      this.lastUpdated = new Date();
+
+      // Check if we need to transition to blocked state
+      const newState = this.getStateUnsafe();
+      if (newState === 'BUDGET_BLOCKED' && this.config.autoBlockEnabled) {
+        console.warn('[BudgetEnforcer] Auto-blocking due to budget exhaustion');
+      }
+
+      return true;
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  private getStateUnsafe(): BudgetState {
+    const percentUsed = (this.spent / this.config.maxBudgetUSDC) * 100;
+
+    if (percentUsed >= 100) {
+      return 'BUDGET_BLOCKED';
+    }
+    if (percentUsed >= this.config.criticalThresholdPercent) {
+      return 'CRITICAL';
+    }
+    if (percentUsed >= this.config.warningThresholdPercent) {
+      return 'WARNING';
+    }
+    return 'HEALTHY';
+  }
+
+  async getStatus(): Promise<BudgetStatus> {
+    await this.acquireLock();
+    try {
+      const state = this.getStateUnsafe();
+      return {
+        spent: this.spent,
+        remaining: Math.max(0, this.config.maxBudgetUSDC - this.spent),
+        percentUsed: (this.spent / this.config.maxBudgetUSDC) * 100,
+        state,
+        isBlocked: state === 'BUDGET_BLOCKED',
+        lastUpdated: this.lastUpdated,
+      };
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  async reset(): Promise<void> {
+    await this.acquireLock();
+    try {
+      this.spent = 0;
+      this.lastUpdated = new Date();
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  async setSpent(amount: number): Promise<void> {
+    await this.acquireLock();
+    try {
+      if (amount < 0) {
+        throw new Error('Spent amount cannot be negative');
+      }
+      this.spent = amount;
+      this.lastUpdated = new Date();
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  getConfig(): BudgetConfig {
+    return { ...this.config };
+  }
 }
 
-export function safeAdd(a: number, b: number): number {
-  return Math.round((a + b) * 1000000) / 1000000;
-}
-
-export function calculateBudgetStatus(
-  spent: number,
-  total: number = BUDGET_LIMITS.DEMO_BUDGET_USDC
-): BudgetStatus {
-  // Handle edge cases
-  if (total <= 0) {
-    return BudgetStatus.BLOCKED;
-  }
-  
-  // Clamp spent to valid range
-  const clampedSpent = Math.max(0, spent);
-  const utilizationRatio = clampedSpent / total;
-
-  // Check for overflow (spent >= total)
-  if (utilizationRatio >= 1.0 || clampedSpent >= total) {
-    return BudgetStatus.BLOCKED;
-  }
-
-  if (utilizationRatio >= BUDGET_LIMITS.CRITICAL_THRESHOLD) {
-    return BudgetStatus.CRITICAL;
-  }
-
-  if (utilizationRatio >= BUDGET_LIMITS.WARNING_THRESHOLD) {
-    return BudgetStatus.WARNING;
-  }
-
-  return BudgetStatus.HEALTHY;
-}
-
-export function getRemainingBudget(
-  spent: number,
-  total: number = BUDGET_LIMITS.DEMO_BUDGET_USDC
-): number {
-  return safeSubtract(total, spent);
-}
-
-export function canAffordPayment(
-  spent: number,
-  paymentAmount: number,
-  total: number = BUDGET_LIMITS.DEMO_BUDGET_USDC
-): boolean {
-  // Validate inputs
-  if (paymentAmount <= 0) {
-    return false;
-  }
-  
-  if (paymentAmount > BUDGET_LIMITS.MAX_SINGLE_PAYMENT) {
-    return false;
-  }
-  
-  const remaining = getRemainingBudget(spent, total);
-  const requiredWithReserve = safeAdd(paymentAmount, BUDGET_LIMITS.MINIMUM_RESERVE);
-  
-  return remaining >= requiredWithReserve;
-}
-
-export function createBudgetState(
-  spent: number,
-  transactionCount: number = 0
-): BudgetState {
-  const total = BUDGET_LIMITS.DEMO_BUDGET_USDC;
-  const clampedSpent = Math.max(0, Math.min(spent, total));
-  
-  return {
-    totalBudget: total,
-    spent: clampedSpent,
-    remaining: getRemainingBudget(clampedSpent, total),
-    status: calculateBudgetStatus(clampedSpent, total),
-    lastUpdated: new Date(),
-    transactionCount: Math.max(0, transactionCount),
-  };
-}
-
-export function validatePaymentAmount(amount: number): { valid: boolean; error?: string } {
-  if (typeof amount !== 'number' || isNaN(amount)) {
-    return { valid: false, error: 'Payment amount must be a valid number' };
-  }
-  
-  if (amount <= 0) {
-    return { valid: false, error: 'Payment amount must be positive' };
-  }
-  
-  if (amount > BUDGET_LIMITS.MAX_SINGLE_PAYMENT) {
-    return { valid: false, error: `Payment exceeds maximum of ${BUDGET_LIMITS.MAX_SINGLE_PAYMENT} USDC` };
-  }
-  
-  // Check for floating point precision issues
-  if (amount !== Math.round(amount * 1000000) / 1000000) {
-    return { valid: false, error: 'Payment amount has too many decimal places' };
-  }
-  
-  return { valid: true };
-}
+export const globalBudgetEnforcer = new BudgetEnforcer();

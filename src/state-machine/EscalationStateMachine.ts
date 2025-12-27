@@ -1,273 +1,164 @@
 import {
   EscalationLevel,
   EscalationState,
-  EscalationTransition,
-  EscalationEvent,
   EscalationContext,
-  StateMachineConfig,
+  EscalationGuard,
+  EscalationTransition,
 } from '../types/escalation';
-import {
-  canEscalate,
-  canDeescalate,
-  shouldBlockForBudget,
-  getGuardConditions,
-} from './guards';
-import {
-  STATE_CONFIGS,
-  TRANSITION_CONFIGS,
-  getStateConfig,
-  findTransition,
-  getTransitionCost,
-} from './config';
+import { defaultGuards, validateTransition } from './guards';
+import { ESCALATION_LEVELS } from './config';
+
+export interface StateMachineConfig {
+  initialLevel: EscalationLevel;
+  guards: EscalationGuard[];
+  onTransition?: (transition: EscalationTransition) => void;
+  onInvalidTransition?: (from: EscalationLevel, to: EscalationLevel, reason: string) => void;
+}
 
 export class EscalationStateMachine {
-  private currentState: EscalationState;
+  private currentLevel: EscalationLevel;
+  private guards: EscalationGuard[];
   private history: EscalationTransition[] = [];
-  private config: StateMachineConfig;
+  private onTransition?: (transition: EscalationTransition) => void;
+  private onInvalidTransition?: (from: EscalationLevel, to: EscalationLevel, reason: string) => void;
+  private lastContext: EscalationContext | null = null;
 
-  constructor(config?: Partial<StateMachineConfig>) {
-    this.config = {
-      initialLevel: EscalationLevel.L0_IDLE,
-      budgetLimit: 10.0,
-      autoDeescalate: true,
-      deescalateDelayMs: 300000, // 5 minutes
-      ...config,
-    };
+  constructor(config: Partial<StateMachineConfig> = {}) {
+    this.currentLevel = config.initialLevel ?? 0;
+    this.guards = config.guards ?? defaultGuards;
+    this.onTransition = config.onTransition;
+    this.onInvalidTransition = config.onInvalidTransition;
+  }
 
-    const stateConfig = getStateConfig(this.config.initialLevel);
-    this.currentState = {
-      level: this.config.initialLevel,
-      enteredAt: new Date(),
-      context: {
-        treasuryId: '',
-        currentSpend: 0,
-        budgetLimit: this.config.budgetLimit,
-        riskScore: 0,
-        liquidityRatio: 1.0,
-        volatilityRegime: 'low',
-        lastMarketDataFetch: null,
-        pendingPaymentId: null,
-      },
-      metadata: {
-        stateName: stateConfig.name,
-        stateColor: stateConfig.color,
-      },
+  getCurrentState(): EscalationState {
+    const levelConfig = ESCALATION_LEVELS[this.currentLevel];
+    return {
+      level: this.currentLevel,
+      name: levelConfig.name,
+      description: levelConfig.description,
+      enteredAt: this.history.length > 0
+        ? this.history[this.history.length - 1].timestamp
+        : new Date(),
+      context: this.lastContext ?? undefined,
     };
   }
 
-  getState(): EscalationState {
-    return { ...this.currentState };
+  canTransitionTo(targetLevel: EscalationLevel, context: EscalationContext): boolean {
+    // First, validate the basic transition
+    const validation = validateTransition(this.currentLevel, targetLevel, context);
+    if (!validation.valid) {
+      return false;
+    }
+
+    // Then check specific guards
+    const applicableGuards = this.guards.filter(
+      (g) => g.from === this.currentLevel && g.to === targetLevel
+    );
+
+    // If no specific guards, check if transition is within one level
+    if (applicableGuards.length === 0) {
+      const levelDiff = Math.abs(targetLevel - this.currentLevel);
+      return levelDiff <= 1;
+    }
+
+    return applicableGuards.some((guard) => guard.evaluate(context));
   }
 
-  getLevel(): EscalationLevel {
-    return this.currentState.level;
+  transition(targetLevel: EscalationLevel, context: EscalationContext): boolean {
+    // Validate the transition first
+    const validation = validateTransition(this.currentLevel, targetLevel, context);
+    if (!validation.valid) {
+      this.onInvalidTransition?.(this.currentLevel, targetLevel, validation.reason!);
+      console.warn(
+        `[EscalationStateMachine] Invalid transition L${this.currentLevel} -> L${targetLevel}: ${validation.reason}`
+      );
+      return false;
+    }
+
+    // Check if we can make this transition
+    if (!this.canTransitionTo(targetLevel, context)) {
+      this.onInvalidTransition?.(
+        this.currentLevel,
+        targetLevel,
+        'Guard conditions not met'
+      );
+      console.warn(
+        `[EscalationStateMachine] Guard conditions not met for L${this.currentLevel} -> L${targetLevel}`
+      );
+      return false;
+    }
+
+    const previousLevel = this.currentLevel;
+    this.currentLevel = targetLevel;
+    this.lastContext = context;
+
+    const transition: EscalationTransition = {
+      from: previousLevel,
+      to: targetLevel,
+      timestamp: new Date(),
+      context,
+      triggeredBy: this.determineTriggeredBy(previousLevel, targetLevel, context),
+    };
+
+    this.history.push(transition);
+    this.onTransition?.(transition);
+
+    console.log(
+      `[EscalationStateMachine] Transitioned L${previousLevel} -> L${targetLevel}`
+    );
+
+    return true;
   }
 
-  getContext(): EscalationContext {
-    return { ...this.currentState.context };
+  private determineTriggeredBy(
+    from: EscalationLevel,
+    to: EscalationLevel,
+    context: EscalationContext
+  ): string {
+    if (context.budgetState === 'BUDGET_BLOCKED') {
+      return 'budget_blocked';
+    }
+    if (to > from) {
+      if (context.anomalyDetected) return 'anomaly_detected';
+      if ((context.volatilityIndex ?? 0) > 0.7) return 'volatility_spike';
+      if ((context.lcr ?? 1) < 0.3) return 'liquidity_crisis';
+      return 'manual_escalation';
+    }
+    if (to < from) {
+      return 'recovery';
+    }
+    return 'no_change';
   }
 
   getHistory(): EscalationTransition[] {
     return [...this.history];
   }
 
-  getAvailableTransitions(): EscalationLevel[] {
-    const currentLevel = this.currentState.level;
-    const context = this.currentState.context;
-
-    return TRANSITION_CONFIGS
-      .filter((t) => t.from === currentLevel)
-      .filter((t) => this.evaluateGuard(t.guard, context))
-      .map((t) => t.to);
-  }
-
-  getTransitionCost(targetLevel: EscalationLevel): number {
-    return getTransitionCost(this.currentState.level, targetLevel);
-  }
-
-  canTransitionTo(targetLevel: EscalationLevel): boolean {
-    const transition = findTransition(this.currentState.level, targetLevel);
-    if (!transition) return false;
-    return this.evaluateGuard(transition.guard, this.currentState.context);
-  }
-
-  private evaluateGuard(guardName: string, context: EscalationContext): boolean {
-    const guards = getGuardConditions();
-
-    switch (guardName) {
-      case 'canStartMonitoring':
-        return guards.canStartMonitoring(context);
-      case 'shouldEscalateToAlert':
-        return guards.shouldEscalateToAlert(context);
-      case 'shouldEscalateToMarketData':
-        return guards.shouldEscalateToMarketData(context);
-      case 'shouldEscalateToCritical':
-        return guards.shouldEscalateToCritical(context);
-      case 'shouldEscalateToEmergency':
-        return guards.shouldEscalateToEmergency(context);
-      case 'canDeescalateFromEmergency':
-        return guards.canDeescalateFromEmergency(context);
-      case 'canDeescalateFromCritical':
-        return guards.canDeescalateFromCritical(context);
-      case 'canDeescalateFromMarketData':
-        return guards.canDeescalateFromMarketData(context);
-      case 'canDeescalateFromAlert':
-        return guards.canDeescalateFromAlert(context);
-      case 'canStopMonitoring':
-        return guards.canStopMonitoring(context);
-      case 'isBudgetExhausted':
-        return shouldBlockForBudget(context);
-      case 'hasBudgetRestored':
-        return context.currentSpend < context.budgetLimit * 0.9;
-      default:
-        console.warn(`Unknown guard: ${guardName}`);
-        return false;
-    }
-  }
-
-  async transition(
-    targetLevel: EscalationLevel,
-    event: EscalationEvent
-  ): Promise<EscalationTransition> {
-    const fromLevel = this.currentState.level;
-    const transitionConfig = findTransition(fromLevel, targetLevel);
-
-    if (!transitionConfig) {
-      throw new Error(
-        `Invalid transition: ${fromLevel} -> ${targetLevel}`
-      );
-    }
-
-    if (!this.evaluateGuard(transitionConfig.guard, this.currentState.context)) {
-      throw new Error(
-        `Guard condition '${transitionConfig.guard}' not satisfied for transition ${fromLevel} -> ${targetLevel}`
-      );
-    }
-
-    // Check budget for paid transitions
-    if (transitionConfig.requiresPayment) {
-      const cost = transitionConfig.cost ?? 0;
-      const newSpend = this.currentState.context.currentSpend + cost;
-
-      if (newSpend > this.currentState.context.budgetLimit) {
-        // Redirect to budget blocked
-        return this.transition(EscalationLevel.BUDGET_BLOCKED, {
-          type: 'BUDGET_EXCEEDED',
-          timestamp: new Date(),
-          payload: { requiredAmount: cost, availableBudget: this.currentState.context.budgetLimit - this.currentState.context.currentSpend },
-        });
-      }
-
-      // Update spend
-      this.currentState.context.currentSpend = newSpend;
-    }
-
-    const now = new Date();
-    const targetConfig = getStateConfig(targetLevel);
-
-    const transition: EscalationTransition = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      from: fromLevel,
-      to: targetLevel,
-      triggeredBy: event,
-      timestamp: now,
-      guardConditions: [transitionConfig.guard],
-      cost: transitionConfig.cost,
-    };
-
-    // Update state
-    this.currentState = {
-      level: targetLevel,
-      enteredAt: now,
-      context: { ...this.currentState.context },
-      previousLevel: fromLevel,
-      metadata: {
-        stateName: targetConfig.name,
-        stateColor: targetConfig.color,
-        lastTransition: transition,
-      },
-    };
-
-    this.history.push(transition);
-
-    return transition;
-  }
-
-  updateContext(updates: Partial<EscalationContext>): void {
-    this.currentState.context = {
-      ...this.currentState.context,
-      ...updates,
-    };
-  }
-
-  async processEvent(event: EscalationEvent): Promise<EscalationTransition | null> {
-    const availableTransitions = this.getAvailableTransitions();
-
-    if (availableTransitions.length === 0) {
-      return null;
-    }
-
-    // Priority: budget block > emergency > critical > market data > alert > monitor > idle
-    const priorityOrder = [
-      EscalationLevel.BUDGET_BLOCKED,
-      EscalationLevel.L5_EMERGENCY,
-      EscalationLevel.L4_CRITICAL,
-      EscalationLevel.L3_MARKET_DATA,
-      EscalationLevel.L2_ALERT,
-      EscalationLevel.L1_MONITOR,
-      EscalationLevel.L0_IDLE,
-    ];
-
-    for (const targetLevel of priorityOrder) {
-      if (availableTransitions.includes(targetLevel)) {
-        return this.transition(targetLevel, event);
+  getAvailableTransitions(context: EscalationContext): EscalationLevel[] {
+    const available: EscalationLevel[] = [];
+    
+    for (let level = 0; level <= 5; level++) {
+      if (level !== this.currentLevel && this.canTransitionTo(level as EscalationLevel, context)) {
+        available.push(level as EscalationLevel);
       }
     }
 
-    return null;
+    return available;
   }
 
   reset(): void {
-    const stateConfig = getStateConfig(this.config.initialLevel);
-    this.currentState = {
-      level: this.config.initialLevel,
-      enteredAt: new Date(),
-      context: {
-        treasuryId: '',
-        currentSpend: 0,
-        budgetLimit: this.config.budgetLimit,
-        riskScore: 0,
-        liquidityRatio: 1.0,
-        volatilityRegime: 'low',
-        lastMarketDataFetch: null,
-        pendingPaymentId: null,
-      },
-      metadata: {
-        stateName: stateConfig.name,
-        stateColor: stateConfig.color,
-      },
-    };
+    this.currentLevel = 0;
     this.history = [];
+    this.lastContext = null;
   }
 
-  exportMermaid(): string {
-    const lines: string[] = ['stateDiagram-v2'];
-
-    // Add states
-    for (const [level, config] of Object.entries(STATE_CONFIGS)) {
-      lines.push(`    ${level}: ${config.name}`);
+  loadState(level: EscalationLevel, history: EscalationTransition[]): void {
+    this.currentLevel = level;
+    this.history = history;
+    if (history.length > 0) {
+      this.lastContext = history[history.length - 1].context;
     }
-
-    lines.push('');
-
-    // Add transitions
-    for (const transition of TRANSITION_CONFIGS) {
-      const label = transition.cost
-        ? `${transition.label} ($${transition.cost})`
-        : transition.label;
-      lines.push(`    ${transition.from} --> ${transition.to}: ${label}`);
-    }
-
-    return lines.join('\n');
   }
 }
+
+export const globalEscalationMachine = new EscalationStateMachine();
