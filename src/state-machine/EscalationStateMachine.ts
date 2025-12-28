@@ -1,164 +1,154 @@
 import {
   EscalationLevel,
   EscalationState,
-  EscalationContext,
-  EscalationGuard,
   EscalationTransition,
+  TransitionTrigger,
 } from '../types/escalation';
-import { defaultGuards, validateTransition } from './guards';
-import { ESCALATION_LEVELS } from './config';
-
-export interface StateMachineConfig {
-  initialLevel: EscalationLevel;
-  guards: EscalationGuard[];
-  onTransition?: (transition: EscalationTransition) => void;
-  onInvalidTransition?: (from: EscalationLevel, to: EscalationLevel, reason: string) => void;
-}
+import { EscalationGuards, GuardContext } from './guards';
+import { ESCALATION_CONFIG } from './config';
+import { EscalationTransitions, TransitionResult } from './transitions';
 
 export class EscalationStateMachine {
-  private currentLevel: EscalationLevel;
-  private guards: EscalationGuard[];
-  private history: EscalationTransition[] = [];
-  private onTransition?: (transition: EscalationTransition) => void;
-  private onInvalidTransition?: (from: EscalationLevel, to: EscalationLevel, reason: string) => void;
-  private lastContext: EscalationContext | null = null;
+  private state: EscalationState;
+  private guards: EscalationGuards;
+  private transitions: EscalationTransitions;
+  private listeners: ((state: EscalationState, result: TransitionResult) => void)[] = [];
 
-  constructor(config: Partial<StateMachineConfig> = {}) {
-    this.currentLevel = config.initialLevel ?? 0;
-    this.guards = config.guards ?? defaultGuards;
-    this.onTransition = config.onTransition;
-    this.onInvalidTransition = config.onInvalidTransition;
+  constructor(initialLevel: EscalationLevel = 'L0') {
+    this.state = {
+      currentLevel: initialLevel,
+      previousLevel: null,
+      enteredAt: new Date(),
+      transitionCount: 0,
+      metadata: {},
+    };
+    this.guards = new EscalationGuards();
+    this.transitions = new EscalationTransitions(this.guards);
   }
 
   getCurrentState(): EscalationState {
-    const levelConfig = ESCALATION_LEVELS[this.currentLevel];
-    return {
-      level: this.currentLevel,
-      name: levelConfig.name,
-      description: levelConfig.description,
-      enteredAt: this.history.length > 0
-        ? this.history[this.history.length - 1].timestamp
-        : new Date(),
-      context: this.lastContext ?? undefined,
-    };
+    return { ...this.state };
   }
 
-  canTransitionTo(targetLevel: EscalationLevel, context: EscalationContext): boolean {
-    // First, validate the basic transition
-    const validation = validateTransition(this.currentLevel, targetLevel, context);
-    if (!validation.valid) {
-      return false;
-    }
+  getCurrentLevel(): EscalationLevel {
+    return this.state.currentLevel;
+  }
 
-    // Then check specific guards
-    const applicableGuards = this.guards.filter(
-      (g) => g.from === this.currentLevel && g.to === targetLevel
+  getLevelConfig(level: EscalationLevel) {
+    return ESCALATION_CONFIG.levels[level];
+  }
+
+  canTransitionTo(targetLevel: EscalationLevel, context: GuardContext): boolean {
+    return this.transitions.canTransition(this.state.currentLevel, targetLevel, context);
+  }
+
+  getBlockingGuards(targetLevel: EscalationLevel, context: GuardContext): string[] {
+    return this.transitions.getBlockingGuards(this.state.currentLevel, targetLevel, context);
+  }
+
+  getAvailableTransitions(context: GuardContext): EscalationLevel[] {
+    return this.transitions.getAvailableTransitions(this.state.currentLevel, context);
+  }
+
+  getTransitionPath(targetLevel: EscalationLevel, context: GuardContext): EscalationLevel[] | null {
+    return this.transitions.getTransitionPath(this.state.currentLevel, targetLevel, context);
+  }
+
+  transition(
+    targetLevel: EscalationLevel,
+    trigger: TransitionTrigger,
+    context: GuardContext
+  ): TransitionResult {
+    const result = this.transitions.executeTransition(
+      this.state,
+      targetLevel,
+      trigger,
+      context
     );
 
-    // If no specific guards, check if transition is within one level
-    if (applicableGuards.length === 0) {
-      const levelDiff = Math.abs(targetLevel - this.currentLevel);
-      return levelDiff <= 1;
+    if (result.success) {
+      this.state = {
+        currentLevel: targetLevel,
+        previousLevel: this.state.currentLevel,
+        enteredAt: new Date(),
+        transitionCount: this.state.transitionCount + 1,
+        metadata: {
+          lastTrigger: trigger,
+          lastTransitionResult: result,
+        },
+      };
+
+      this.notifyListeners(result);
     }
 
-    return applicableGuards.some((guard) => guard.evaluate(context));
+    return result;
   }
 
-  transition(targetLevel: EscalationLevel, context: EscalationContext): boolean {
-    // Validate the transition first
-    const validation = validateTransition(this.currentLevel, targetLevel, context);
-    if (!validation.valid) {
-      this.onInvalidTransition?.(this.currentLevel, targetLevel, validation.reason!);
-      console.warn(
-        `[EscalationStateMachine] Invalid transition L${this.currentLevel} -> L${targetLevel}: ${validation.reason}`
-      );
-      return false;
+  escalate(context: GuardContext): TransitionResult | null {
+    const currentIndex = this.getLevelIndex(this.state.currentLevel);
+    const levels: EscalationLevel[] = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5'];
+
+    if (currentIndex >= levels.length - 1) {
+      return null; // Already at max level
     }
 
-    // Check if we can make this transition
-    if (!this.canTransitionTo(targetLevel, context)) {
-      this.onInvalidTransition?.(
-        this.currentLevel,
-        targetLevel,
-        'Guard conditions not met'
-      );
-      console.warn(
-        `[EscalationStateMachine] Guard conditions not met for L${this.currentLevel} -> L${targetLevel}`
-      );
-      return false;
-    }
-
-    const previousLevel = this.currentLevel;
-    this.currentLevel = targetLevel;
-    this.lastContext = context;
-
-    const transition: EscalationTransition = {
-      from: previousLevel,
-      to: targetLevel,
-      timestamp: new Date(),
-      context,
-      triggeredBy: this.determineTriggeredBy(previousLevel, targetLevel, context),
-    };
-
-    this.history.push(transition);
-    this.onTransition?.(transition);
-
-    console.log(
-      `[EscalationStateMachine] Transitioned L${previousLevel} -> L${targetLevel}`
-    );
-
-    return true;
+    const nextLevel = levels[currentIndex + 1];
+    return this.transition(nextLevel, 'RISK_THRESHOLD', context);
   }
 
-  private determineTriggeredBy(
-    from: EscalationLevel,
-    to: EscalationLevel,
-    context: EscalationContext
-  ): string {
-    if (context.budgetState === 'BUDGET_BLOCKED') {
-      return 'budget_blocked';
-    }
-    if (to > from) {
-      if (context.anomalyDetected) return 'anomaly_detected';
-      if ((context.volatilityIndex ?? 0) > 0.7) return 'volatility_spike';
-      if ((context.lcr ?? 1) < 0.3) return 'liquidity_crisis';
-      return 'manual_escalation';
-    }
-    if (to < from) {
-      return 'recovery';
-    }
-    return 'no_change';
-  }
+  deescalate(context: GuardContext): TransitionResult | null {
+    const currentIndex = this.getLevelIndex(this.state.currentLevel);
+    const levels: EscalationLevel[] = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5'];
 
-  getHistory(): EscalationTransition[] {
-    return [...this.history];
-  }
-
-  getAvailableTransitions(context: EscalationContext): EscalationLevel[] {
-    const available: EscalationLevel[] = [];
-    
-    for (let level = 0; level <= 5; level++) {
-      if (level !== this.currentLevel && this.canTransitionTo(level as EscalationLevel, context)) {
-        available.push(level as EscalationLevel);
-      }
+    if (currentIndex <= 0) {
+      return null; // Already at min level
     }
 
-    return available;
+    const prevLevel = levels[currentIndex - 1];
+    return this.transition(prevLevel, 'RISK_CLEARED', context);
   }
 
   reset(): void {
-    this.currentLevel = 0;
-    this.history = [];
-    this.lastContext = null;
+    this.state = {
+      currentLevel: 'L0',
+      previousLevel: this.state.currentLevel,
+      enteredAt: new Date(),
+      transitionCount: this.state.transitionCount + 1,
+      metadata: { resetAt: new Date() },
+    };
   }
 
-  loadState(level: EscalationLevel, history: EscalationTransition[]): void {
-    this.currentLevel = level;
-    this.history = history;
-    if (history.length > 0) {
-      this.lastContext = history[history.length - 1].context;
+  onTransition(listener: (state: EscalationState, result: TransitionResult) => void): () => void {
+    this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener);
+    };
+  }
+
+  getTransitionHistory(): TransitionResult[] {
+    return this.transitions.getTransitionHistory();
+  }
+
+  getAllTransitions(): EscalationTransition[] {
+    return ESCALATION_CONFIG.transitions;
+  }
+
+  private getLevelIndex(level: EscalationLevel): number {
+    const levels: EscalationLevel[] = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5'];
+    return levels.indexOf(level);
+  }
+
+  private notifyListeners(result: TransitionResult): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(this.state, result);
+      } catch (error) {
+        console.error('Error in transition listener:', error);
+      }
     }
   }
 }
 
-export const globalEscalationMachine = new EscalationStateMachine();
+export function createStateMachine(initialLevel?: EscalationLevel): EscalationStateMachine {
+  return new EscalationStateMachine(initialLevel);
+}
