@@ -4,4 +4,4 @@ A DAO CFO risk console with self-funding HTTP 402 micropayments for market data 
 
 ## Updates
 
-Commit 28
+Commit 40
