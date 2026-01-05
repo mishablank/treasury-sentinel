@@ -1,150 +1,132 @@
-/**
- * @module types/escalation
- * @description Escalation state machine types for risk level management
- * 
- * The escalation system uses a 6-level ladder (L0-L5) to progressively
- * increase monitoring and data acquisition as risk increases.
- */
-
-/**
- * Escalation levels from normal operation (L0) to critical (L5)
- * @description
- * - L0: Normal - Baseline monitoring, no market data needed
- * - L1: Elevated - Increased monitoring frequency
- * - L2: Warning - Basic market data acquisition begins
- * - L3: High - Full market depth analysis
- * - L4: Critical - Real-time monitoring with all data sources
- * - L5: Emergency - Maximum data acquisition, human intervention needed
- */
 export type EscalationLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
 
-/**
- * Special system states outside the normal escalation ladder
- */
-export type SystemState = 'BUDGET_BLOCKED' | 'PAUSED' | 'ERROR';
+export type EscalationState = 
+  | 'IDLE'
+  | 'MONITORING'
+  | 'ESCALATING'
+  | 'AWAITING_PAYMENT'
+  | 'PAYMENT_PENDING'
+  | 'BUDGET_BLOCKED'
+  | 'COOLDOWN';
 
-/**
- * All possible states the escalation machine can be in
- */
-export type EscalationState = EscalationLevel | SystemState;
+export interface PendingPayment {
+  amount: number;
+  currency: string;
+  requestedAt: number;
+  txHash?: string;
+}
 
-/**
- * Events that can trigger state transitions
- * @description Each event represents a detected condition or user action
- */
-export type EscalationEvent =
-  | 'RISK_INCREASE'      // Risk metrics exceeded threshold
-  | 'RISK_DECREASE'      // Risk metrics returned to normal
-  | 'BUDGET_EXCEEDED'    // 10 USDC demo budget exhausted
-  | 'BUDGET_REPLENISHED' // Budget restored (manual action)
-  | 'MANUAL_ESCALATE'    // User-initiated escalation
-  | 'MANUAL_DEESCALATE'  // User-initiated de-escalation
-  | 'SYSTEM_ERROR'       // Unrecoverable error occurred
-  | 'SYSTEM_RECOVER'     // Error condition cleared
-  | 'PAUSE'              // User paused the system
-  | 'RESUME';            // User resumed the system
+export interface EscalationContext {
+  currentLevel: EscalationLevel;
+  riskScore: number;
+  totalSpent: number;
+  budgetLimit: number;
+  lastEscalationTime?: number;
+  cooldownMs: number;
+  pendingPayment?: PendingPayment;
+  lastPaymentVerified: boolean;
+  chainId?: number;
+  treasuryAddress?: string;
+}
 
-/**
- * Context passed to guard functions for transition decisions
- * @interface GuardContext
- */
-export interface GuardContext {
-  /** Current escalation state */
-  currentState: EscalationState;
-  /** Event attempting to trigger transition */
-  event: EscalationEvent;
-  /** Current risk metrics snapshot */
-  riskMetrics: RiskMetrics;
-  /** Current budget status */
-  budgetStatus: BudgetStatus;
-  /** Timestamp of context creation */
+export interface EscalationEvent {
+  type: 'ESCALATE' | 'DE_ESCALATE' | 'PAYMENT_REQUIRED' | 'PAYMENT_CONFIRMED' | 'PAYMENT_FAILED' | 'BUDGET_EXHAUSTED' | 'COOLDOWN_COMPLETE' | 'RISK_UPDATE';
+  payload?: {
+    targetLevel?: EscalationLevel;
+    amount?: number;
+    txHash?: string;
+    riskScore?: number;
+    reason?: string;
+  };
   timestamp: number;
 }
 
-/**
- * Risk metrics used for escalation decisions
- * @interface RiskMetrics
- */
-export interface RiskMetrics {
-  /** Liquidity Coverage Ratio (>100% is healthy) */
-  lcr: number;
-  /** Time to exit 50% of position (hours) */
-  exitHalfLife: number;
-  /** Current volatility regime classification */
-  volatilityRegime: 'low' | 'medium' | 'high' | 'extreme';
-  /** Maximum price impact for full exit (percentage) */
-  maxPriceImpact: number;
-  /** Overall risk score (0-100) */
-  riskScore: number;
-}
-
-/**
- * Budget tracking status for micropayment enforcement
- * @interface BudgetStatus
- */
-export interface BudgetStatus {
-  /** Total budget allocated (USDC) */
-  totalBudget: number;
-  /** Amount spent so far (USDC) */
-  spent: number;
-  /** Remaining budget (USDC) */
-  remaining: number;
-  /** Whether budget is exhausted */
-  isExhausted: boolean;
-  /** Last payment timestamp */
-  lastPaymentTime: number;
-}
-
-/**
- * Defines a valid state transition in the escalation machine
- * @interface EscalationTransition
- */
 export interface EscalationTransition {
-  /** Source state */
   from: EscalationState;
-  /** Target state */
   to: EscalationState;
-  /** Triggering event */
-  event: EscalationEvent;
-  /** Guard function name (if any) */
-  guard?: string;
-  /** Human-readable transition description */
+  event: EscalationEvent['type'];
+  guards?: string[];
+  actions?: string[];
+}
+
+export interface GuardCondition {
+  id: string;
+  name: string;
   description: string;
 }
 
-/**
- * Complete state machine configuration
- * @interface EscalationConfig
- */
-export interface EscalationConfig {
-  /** Initial state on startup */
-  initialState: EscalationState;
-  /** All valid transitions */
-  transitions: EscalationTransition[];
-  /** State-specific configurations */
-  stateConfigs: Record<EscalationState, StateConfig>;
+export interface EscalationSnapshot {
+  id: string;
+  timestamp: number;
+  state: EscalationState;
+  level: EscalationLevel;
+  context: EscalationContext;
+  lastEvent?: EscalationEvent;
 }
 
-/**
- * Configuration specific to each state
- * @interface StateConfig
- */
-export interface StateConfig {
-  /** Display label for UI */
-  label: string;
-  /** State description */
+export interface LevelConfig {
+  level: EscalationLevel;
+  name: string;
   description: string;
-  /** Whether market data acquisition is active */
-  marketDataEnabled: boolean;
-  /** Monitoring interval (minutes) */
-  monitoringInterval: number;
-  /** Data sources to query in this state */
-  dataSources: DataSource[];
-  /** Color for UI visualization */
-  color: string;
+  riskThreshold: number;
+  estimatedCost: number;
+  dataFeatures: string[];
+  cooldownMs: number;
 }
 
-/**
- * Available data sources for market data acquisition
- */
-export type DataSource = 'kaiko_spot' | 'kaiko_depth' | 'kaiko_trades' | 'kaiko_ohlcv';
+export const LEVEL_CONFIGS: Record<EscalationLevel, LevelConfig> = {
+  'L0': {
+    level: 'L0',
+    name: 'Basic Monitoring',
+    description: 'On-chain balance snapshots only',
+    riskThreshold: 0,
+    estimatedCost: 0,
+    dataFeatures: ['Balance snapshots', 'Token holdings'],
+    cooldownMs: 0
+  },
+  'L1': {
+    level: 'L1',
+    name: 'Price Feeds',
+    description: 'Add spot price data',
+    riskThreshold: 0.2,
+    estimatedCost: 0.5,
+    dataFeatures: ['Spot prices', 'Portfolio valuation'],
+    cooldownMs: 60000
+  },
+  'L2': {
+    level: 'L2',
+    name: 'Volatility Regime',
+    description: 'Add volatility indicators',
+    riskThreshold: 0.4,
+    estimatedCost: 1.0,
+    dataFeatures: ['Volatility metrics', 'Regime detection'],
+    cooldownMs: 120000
+  },
+  'L3': {
+    level: 'L3',
+    name: 'Depth Analysis',
+    description: 'Add order book depth data',
+    riskThreshold: 0.6,
+    estimatedCost: 2.0,
+    dataFeatures: ['Depth bands', 'Bid-ask analysis'],
+    cooldownMs: 180000
+  },
+  'L4': {
+    level: 'L4',
+    name: 'Impact Curves',
+    description: 'Add market impact modeling',
+    riskThreshold: 0.8,
+    estimatedCost: 3.0,
+    dataFeatures: ['Impact curves', 'Slippage estimation'],
+    cooldownMs: 300000
+  },
+  'L5': {
+    level: 'L5',
+    name: 'Full Suite',
+    description: 'Complete liquidity risk analysis',
+    riskThreshold: 0.95,
+    estimatedCost: 4.0,
+    dataFeatures: ['LCR calculation', 'Exit half-life', 'Full risk metrics'],
+    cooldownMs: 600000
+  }
+};
