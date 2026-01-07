@@ -1,3 +1,10 @@
+![Chains](https://img.shields.io/badge/EVM-Ethereum%20%7C%20Gnosis%20%7C%20Arbitrum%20%7C%20Optimism%20%7C%20Base-627EEA?style=flat)
+![Cron](https://img.shields.io/badge/Agent-Cron%2015m-blue?style=flat)
+![Payments](https://img.shields.io/badge/Payments-HTTP%20402%20%7C%20USDC%20on%20Base-2E7CF6?style=flat)
+![Data](https://img.shields.io/badge/Data-Kaiko--Only-0B3C5D?style=flat)
+![Mode](https://img.shields.io/badge/Mode-Advisory%20Only-lightgrey?style=flat)
+
+
 # 🛡️ Treasury Sentinel
 
 **Treasury Sentinel** is a **DAO CFO–style treasury risk monitoring agent** for EVM treasuries.
