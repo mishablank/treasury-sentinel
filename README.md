@@ -71,17 +71,17 @@ Pricing is **per endpoint** and enforced via HTTP 402.
 
 The agent follows an **explicit state machine**.  
 
-MONITORING
+- MONITORING
 ↓ (schedule / price move)
-REGIME_DETECTION
+- REGIME_DETECTION
 ↓ (volatility ≥ threshold)
-DEPTH_REQUIRED → [402 → /depth]
+- DEPTH_REQUIRED → [402 → /depth]
 ↓ (LCR < threshold)
-IMPACT_REQUIRED → [402 → /impact]
+- IMPACT_REQUIRED → [402 → /impact]
 ↓
-STRESS_SIMULATION
+- STRESS_SIMULATION
 ↓
-RECOMMENDATION
+- RECOMMENDATION
 
 
 ### Terminal States
