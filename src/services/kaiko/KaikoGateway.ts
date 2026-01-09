@@ -162,9 +162,10 @@ export class KaikoGateway {
    */
   private buildEndpoint(request: KaikoMarketDataRequest): string {
     const { instrument, exchange, dataType } = request;
-    let path = `/${dataType}/${instrument}`;
+    // Encode URL path segments to prevent injection attacks
+    let path = `/${dataType}/${encodeURIComponent(instrument)}`;
     if (exchange) {
-      path += `?exchange=${exchange}`;
+      path += `?exchange=${encodeURIComponent(exchange)}`;
     }
     return `${this.config.apiBaseUrl}${path}`;
   }
